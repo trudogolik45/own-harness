@@ -1,0 +1,22 @@
+[project]
+name = "own-harness"
+version = "0.1.0"
+description = "Минимальный харнес: LLM + инструменты + агентный цикл + память + хуки"
+requires-python = ">=3.10"
+dependencies = ["openai>=1.50"]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
