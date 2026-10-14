@@ -4,7 +4,8 @@ from harness.hooks import Hooks
 from harness.llm import Reply, ToolCall
 import pytest
 
-from harness.loop import BLOCKED, NUDGE, STUB_PREFIX, Agent
+from harness.conversation import STUB_PREFIX
+from harness.loop import BLOCKED, NUDGE, Agent
 from harness.tools import ToolBox, file_tools
 
 
@@ -154,3 +155,25 @@ def test_nudges_are_limited_so_silent_model_still_stops(tmp_path: Path) -> None:
 
     assert agent.run("почини") == ""
     assert len(llm.seen) == 3
+
+
+def test_old_result_that_looks_like_a_stub_is_still_hidden(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text(STUB_PREFIX + "x" * 300)
+    replies = [*read_calls("big.txt", "big.txt"), Reply("ok", [])]
+    agent, llm = make_agent(tmp_path, replies, stale_result_chars=100)
+
+    agent.run("читай")
+
+    old_result = [m["content"] for m in llm.seen[2] if m["role"] == "tool"][0]
+    assert old_result.startswith(STUB_PREFIX + "311 символов")
+
+
+def test_stub_shorter_limit_keeps_the_original_length(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text("x" * 300)
+    replies = [*read_calls("big.txt", "big.txt", "big.txt"), Reply("ok", [])]
+    agent, llm = make_agent(tmp_path, replies, stale_result_chars=10)
+
+    agent.run("читай")
+
+    first_result = [m["content"] for m in llm.seen[3] if m["role"] == "tool"][0]
+    assert first_result.startswith(STUB_PREFIX + "300 символов")

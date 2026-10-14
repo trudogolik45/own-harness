@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from harness.tools import Tool, resolve_inside
+from harness.tools import PROTECTED_DIRS, Tool, resolve_inside
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,6 @@ ALLOWLIST: tuple[Rule, ...] = (
     Rule(("git", "log"), **_GIT_LOG),
 )
 
-PROTECTED_DIRS = frozenset({".git", ".venv"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 
 _SHELL_SYNTAX = re.compile(r"[;&|<>`$\x00-\x1f\x7f]")
@@ -117,41 +116,67 @@ def _short_first(flag: str) -> tuple[bool, str]:
     return flag.startswith("--"), flag
 
 
-def shell_guard(root: Path, ask: Callable[[str], bool]) -> Callable[..., bool]:
-    """Хук before_tool: безопасное пропускает, остальное отдаёт на подтверждение."""
+class ShellPolicy:
+    """Решает, что можно выполнить: хук before_tool и run_command, который выполняет только одобренное.
 
-    def guard(name: str, args: dict) -> bool:
+    Команда из белого списка идёт без вопроса и без shell. Остальное — только после ask, и тогда через shell.
+    ask_every_tool: спрашивать про каждый вызов любого инструмента (флаг --approve).
+    """
+
+    def __init__(self, root: Path, ask: Callable[[str], bool], ask_every_tool: bool = False) -> None:
+        self._root = root
+        self._ask = ask
+        self._ask_every_tool = ask_every_tool
+        self._approved: str | None = None  # одобрение живёт до следующего решения
+
+    def guard(self, name: str, args: dict) -> bool:
+        self._approved = None
         if name == "run_command":
-            return _guard_command(args.get("command"), ask)
+            return self._guard_command(args.get("command"))
+        if self._ask_every_tool:
+            return self._ask(f"{name}({args})")
         if name in WRITE_TOOLS:
-            return _guard_write(root, name, str(args.get("path", "")), ask)
+            return self._guard_write(name, str(args.get("path", "")))
         return True
 
-    return guard
+    def tool(self, timeout: float = 120) -> Tool:
+        return _run_command_tool(self._root, timeout, self._shell_needed)
+
+    def _guard_command(self, command: object) -> bool:
+        if not isinstance(command, str):
+            return False
+        if is_allowed(command) and not self._ask_every_tool:
+            return True
+        if not self._ask(command):
+            return False
+        self._approved = command
+        return True
+
+    def _guard_write(self, tool: str, path: str) -> bool:
+        try:
+            relative = resolve_inside(self._root, path).relative_to(self._root.resolve())
+        except ValueError:
+            return True  # путь вне root инструмент отклонит сам
+        top = relative.parts[0].casefold() if relative.parts else ""
+        return top not in PROTECTED_DIRS or self._ask(f"{tool} {path}")
+
+    def _shell_needed(self, command: str) -> bool | None:
+        """False — запустить без shell, True — через shell, None — никто не одобрял."""
+        if command == self._approved:
+            self._approved = None
+            return not is_allowed(command)
+        return False if is_allowed(command) else None
 
 
-def _guard_command(command: object, ask: Callable[[str], bool]) -> bool:
-    if not isinstance(command, str):
-        return False
-    return is_allowed(command) or ask(command)
-
-
-def _guard_write(root: Path, tool: str, path: str, ask: Callable[[str], bool]) -> bool:
-    try:
-        relative = resolve_inside(root, path).relative_to(root.resolve())
-    except ValueError:
-        return True  # путь вне root инструмент отклонит сам
-    top = relative.parts[0].casefold() if relative.parts else ""
-    return top not in PROTECTED_DIRS or ask(f"{tool} {path}")
-
-
-def run_command_tool(root: Path, timeout: float = 120) -> Tool:
+def _run_command_tool(root: Path, timeout: float, shell_needed: Callable[[str], bool | None]) -> Tool:
     def run_command(command: str) -> str:
         # Проверенную команду запускаем без shell: выполняется ровно то, что прошло is_allowed.
         # Shell нужен только командам, которые пользователь одобрил вручную.
-        safe = is_allowed(command)
+        shell = shell_needed(command)
+        if shell is None:
+            return "error: команда не одобрена пользователем"
         try:
-            process = _start(command, safe)
+            process = _start(command, shell)
         except FileNotFoundError as error:
             return f"exit code: 127\ncommand not found: {error.filename}"
         try:
@@ -162,10 +187,10 @@ def run_command_tool(root: Path, timeout: float = 120) -> Tool:
             return f"error: timed out after {timeout}s"
         return f"exit code: {process.returncode}\n{output}"
 
-    def _start(command: str, safe: bool) -> subprocess.Popen:
+    def _start(command: str, shell: bool) -> subprocess.Popen:
         return subprocess.Popen(
-            shlex.split(command) if safe else command,
-            shell=not safe,
+            command if shell else shlex.split(command),
+            shell=shell,
             cwd=root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

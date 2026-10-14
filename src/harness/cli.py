@@ -5,20 +5,23 @@ import argparse
 import os
 from pathlib import Path
 
+from openai import OpenAI
+
 from harness.hooks import Hooks
 from harness.llm import OpenAICompatibleLLM, Reply
 from harness.loop import Agent
 from harness.memory import build_system_prompt
-from harness.shell import run_command_tool, shell_guard
+from harness.shell import ShellPolicy
 from harness.tools import ToolBox, file_tools, search_tool
 
 
 def main() -> None:
     args = _parse_args()
     root = Path(args.root).resolve()
-    llm = OpenAICompatibleLLM(args.base_url, args.model, args.api_key)
-    tools = ToolBox([*file_tools(root), search_tool(root), run_command_tool(root)])
-    agent = Agent(llm, tools, _hooks(root, args.approve), build_system_prompt(root))
+    llm = OpenAICompatibleLLM(OpenAI(base_url=args.base_url, api_key=args.api_key), args.model)
+    policy = ShellPolicy(root, _ask, ask_every_tool=args.approve)
+    tools = ToolBox([*file_tools(root), search_tool(root), policy.tool()])
+    agent = Agent(llm, tools, _hooks(policy), build_system_prompt(root))
     print(f"model={args.model} root={root} approve={args.approve}. Пустая строка — выход.")
     while True:
         try:
@@ -30,12 +33,11 @@ def main() -> None:
         print(agent.run(text))
 
 
-def _hooks(root: Path, approve: bool) -> Hooks:
+def _hooks(policy: ShellPolicy) -> Hooks:
     hooks = Hooks()
     hooks.on("llm_reply", _log_iteration)
     hooks.on("after_tool", lambda name, result: print(f"  ← {name}: {result[:80]!r}"))
-    guard = _ask_approval if approve else shell_guard(root, _ask_command)
-    hooks.on("before_tool", guard)
+    hooks.on("before_tool", policy.guard)
     return hooks
 
 
@@ -44,12 +46,8 @@ def _log_iteration(iteration: int, reply: Reply) -> None:
     print(f"[итерация {iteration}] {calls}")
 
 
-def _ask_command(action: str) -> bool:
+def _ask(action: str) -> bool:
     return input(f"  разрешить {action!r}? [y/N] ").strip().lower() == "y"
-
-
-def _ask_approval(name: str, args: dict) -> bool:
-    return input(f"  разрешить {name}({args})? [y/N] ").strip().lower() == "y"
 
 
 def _parse_args() -> argparse.Namespace:

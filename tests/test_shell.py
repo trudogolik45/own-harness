@@ -6,9 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from harness.shell import ALLOWLIST, describe_allowlist, is_allowed, run_command_tool, shell_guard
+from harness.shell import ALLOWLIST, ShellPolicy, describe_allowlist, is_allowed
 
 ROOT = Path("/tmp/harness-guard-root")
+
+
+def approved_run(root: Path, command: str, timeout: float = 120) -> str:
+    policy = ShellPolicy(root, ask=lambda _: True)
+    assert policy.guard(name="run_command", args={"command": command})
+    return policy.tool(timeout).run(command=command)
 
 
 @pytest.mark.parametrize(
@@ -73,9 +79,7 @@ def test_risky_commands_need_approval(command: str) -> None:
 
 
 def test_run_command_returns_output_and_exit_code(tmp_path: Path) -> None:
-    tool = run_command_tool(tmp_path)
-
-    result = tool.run(command=f"{sys.executable} -c \"import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)\"")
+    result = approved_run(tmp_path, f"{sys.executable} -c \"import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)\"")
 
     assert "exit code: 3" in result
     assert "out" in result
@@ -85,7 +89,7 @@ def test_run_command_returns_output_and_exit_code(tmp_path: Path) -> None:
 def test_run_command_uses_root_as_cwd(tmp_path: Path) -> None:
     (tmp_path / "marker.txt").write_text("")
 
-    result = run_command_tool(tmp_path).run(command="ls")
+    result = approved_run(tmp_path, "ls")
 
     assert "marker.txt" in result
 
@@ -97,7 +101,7 @@ def test_allowed_command_is_run_without_shell_expansion(tmp_path: Path, monkeypa
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake.parent}:{os.environ['PATH']}")
 
-    result = run_command_tool(tmp_path).run(command="pytest {--basetemp=victim,x}")
+    result = approved_run(tmp_path, "pytest {--basetemp=victim,x}")
 
     assert "{--basetemp=victim,x}" in result
 
@@ -105,23 +109,22 @@ def test_allowed_command_is_run_without_shell_expansion(tmp_path: Path, monkeypa
 def test_missing_program_reports_exit_127(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))
 
-    result = run_command_tool(tmp_path).run(command="ruff check")
+    result = approved_run(tmp_path, "ruff check")
 
     assert result.startswith("exit code: 127")
     assert "ruff" in result
 
 
 def test_run_command_does_not_read_terminal_stdin(tmp_path: Path) -> None:
-    result = run_command_tool(tmp_path, timeout=5).run(command="cat")
+    result = approved_run(tmp_path, "cat", timeout=5)
 
     assert result.startswith("exit code: 0")
 
 
 def test_timeout_kills_whole_process_group(tmp_path: Path) -> None:
-    tool = run_command_tool(tmp_path, timeout=0.5)
     pause = f"sleep 30.{os.getpid()}"
 
-    result = tool.run(command=f"{pause}; echo done")
+    result = approved_run(tmp_path, f"{pause}; echo done", timeout=0.5)
 
     assert result.startswith("error: timed out after 0.5s")
     time.sleep(0.2)
@@ -131,19 +134,19 @@ def test_timeout_kills_whole_process_group(tmp_path: Path) -> None:
 
 def test_guard_skips_question_for_safe_command() -> None:
     asked: list[str] = []
-    guard = shell_guard(ROOT, lambda what: asked.append(what) or False)
+    guard = ShellPolicy(ROOT, lambda what: asked.append(what) or False).guard
 
     assert guard(name="run_command", args={"command": "git status"}) is True
     assert asked == []
 
 
 def test_guard_asks_for_risky_commands_and_respects_answer() -> None:
-    assert shell_guard(ROOT, lambda _: False)(name="run_command", args={"command": "git push"}) is False
-    assert shell_guard(ROOT, lambda _: True)(name="run_command", args={"command": "git push"}) is True
+    assert ShellPolicy(ROOT, lambda _: False).guard(name="run_command", args={"command": "git push"}) is False
+    assert ShellPolicy(ROOT, lambda _: True).guard(name="run_command", args={"command": "git push"}) is True
 
 
 def test_guard_rejects_non_string_command_without_crashing() -> None:
-    assert shell_guard(ROOT, lambda _: True)(name="run_command", args={"command": ["git", "status"]}) is False
+    assert ShellPolicy(ROOT, lambda _: True).guard(name="run_command", args={"command": ["git", "status"]}) is False
 
 
 @pytest.mark.parametrize(
@@ -152,14 +155,14 @@ def test_guard_rejects_non_string_command_without_crashing() -> None:
 @pytest.mark.parametrize("tool", ["write_file", "edit_file"])
 def test_guard_asks_before_changing_tool_internals(path: str, tool: str) -> None:
     asked: list[str] = []
-    guard = shell_guard(ROOT, lambda what: asked.append(what) or False)
+    guard = ShellPolicy(ROOT, lambda what: asked.append(what) or False).guard
 
     assert guard(name=tool, args={"path": path}) is False
     assert asked == [f"{tool} {path}"]
 
 
 def test_guard_lets_ordinary_writes_through() -> None:
-    guard = shell_guard(ROOT, lambda _: False)
+    guard = ShellPolicy(ROOT, lambda _: False).guard
 
     assert guard(name="write_file", args={"path": "src/app.py", "content": ""}) is True
     assert guard(name="edit_file", args={"path": "src/app.py", "old": "a", "new": "b"}) is True
@@ -167,7 +170,7 @@ def test_guard_lets_ordinary_writes_through() -> None:
 
 
 def test_run_command_description_lists_allowed_commands_and_flags() -> None:
-    description = run_command_tool(ROOT).description
+    description = ShellPolicy(ROOT, ask=lambda _: False).tool().description
 
     assert "uv run pytest [-q|" in description
     assert "-k ЗНАЧЕНИЕ" in description
@@ -176,7 +179,7 @@ def test_run_command_description_lists_allowed_commands_and_flags() -> None:
 
 
 def test_run_command_description_includes_the_rendered_allowlist() -> None:
-    assert describe_allowlist() in run_command_tool(ROOT).description
+    assert describe_allowlist() in ShellPolicy(ROOT, ask=lambda _: False).tool().description
 
 
 @pytest.mark.parametrize("rule", ALLOWLIST, ids=lambda rule: " ".join(rule.prefix))
@@ -192,10 +195,50 @@ def test_every_described_flag_passes_the_allowlist(rule) -> None:
 def test_commands_do_not_inherit_harness_virtualenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VIRTUAL_ENV", "/harness/.venv")
     monkeypatch.setenv("PATH", f"/harness/.venv/bin:{os.environ['PATH']}")
-    tool = run_command_tool(tmp_path)
 
-    venv = tool.run(command="printenv VIRTUAL_ENV")
-    path = tool.run(command="printenv PATH")
+    venv = approved_run(tmp_path, "printenv VIRTUAL_ENV")
+    path = approved_run(tmp_path, "printenv PATH")
 
     assert venv.startswith("exit code: 1") and "/harness/.venv" not in venv
     assert "/harness/.venv/bin" not in path
+
+
+def test_tool_refuses_command_nobody_approved(tmp_path: Path) -> None:
+    policy = ShellPolicy(tmp_path, ask=lambda _: True)
+
+    result = policy.tool().run(command="touch made.txt")
+
+    assert result.startswith("error:")
+    assert not (tmp_path / "made.txt").exists()
+
+
+def test_approval_lets_the_command_run_once(tmp_path: Path) -> None:
+    policy = ShellPolicy(tmp_path, ask=lambda _: True)
+    tool = policy.tool()
+    policy.guard(name="run_command", args={"command": "echo one && echo two"})
+
+    first = tool.run(command="echo one && echo two")
+    second = tool.run(command="echo one && echo two")
+
+    assert first == "exit code: 0\none\ntwo\n"
+    assert second.startswith("error:")
+
+
+def test_approve_mode_asks_about_every_tool_call(tmp_path: Path) -> None:
+    asked: list[str] = []
+    policy = ShellPolicy(tmp_path, ask=lambda what: asked.append(what) or False, ask_every_tool=True)
+
+    assert policy.guard(name="read_file", args={"path": "a.txt"}) is False
+    assert policy.guard(name="run_command", args={"command": "git status"}) is False
+    assert asked == ["read_file({'path': 'a.txt'})", "git status"]
+
+
+def test_approval_does_not_outlive_the_next_decision(tmp_path: Path) -> None:
+    policy = ShellPolicy(tmp_path, ask=lambda what: what == "touch made.txt")
+    policy.guard(name="run_command", args={"command": "touch made.txt"})
+    policy.guard(name="run_command", args={"command": "rm -rf src"})
+
+    result = policy.tool().run(command="touch made.txt")
+
+    assert result.startswith("error:")
+    assert not (tmp_path / "made.txt").exists()

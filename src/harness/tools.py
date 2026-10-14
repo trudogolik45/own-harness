@@ -99,8 +99,10 @@ def file_tools(root: Path) -> list[Tool]:
     ]
 
 
+# Служебные папки: агенту туда не писать без спроса и не искать в них.
+PROTECTED_DIRS = frozenset({".git", ".venv"})
 # rg и так не заходит в скрытые папки; глобы страхуют, если это когда-нибудь включат.
-RG_EXCLUDES = ("!.git/", "!.venv/")
+RG_EXCLUDES = tuple(f"!{name}/" for name in sorted(PROTECTED_DIRS))
 RG_NO_MATCH = 1
 
 
